@@ -7,7 +7,7 @@ import (
 )
 
 func TestVersion(t *testing.T) {
-	if Version != "v0.1.0" {
+	if Version != "v0.3.0" {
 		t.Fatalf("unexpected version: %q", Version)
 	}
 }
@@ -78,6 +78,7 @@ func TestMSDRoundTripExtremeDates(t *testing.T) {
 	tests := []time.Time{
 		time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(1600, 6, 15, 9, 30, 15, 987654321, time.UTC),
+		time.Date(1850, 1, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(9999, 12, 31, 23, 59, 59, 999000000, time.UTC),
 	}
 	for _, base := range tests {
@@ -90,6 +91,25 @@ func TestMSDRoundTripExtremeDates(t *testing.T) {
 		if delta > 50*time.Millisecond {
 			t.Fatalf("extreme round-trip drift too large for %v: %v", base, delta)
 		}
+	}
+}
+
+func TestAddSolsSafe(t *testing.T) {
+	start := FromEarth(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	next, err := start.AddSolsSafe(1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	delta := next.Sub(start).Seconds()
+	if math.Abs(delta-SecondsPerSol) > 1e-6 {
+		t.Fatalf("expected one sol=%f, got %f", SecondsPerSol, delta)
+	}
+}
+
+func TestAddSolsSafeOverflow(t *testing.T) {
+	start := FromEarth(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if _, err := start.AddSolsSafe(math.MaxFloat64); err == nil {
+		t.Fatal("expected overflow error")
 	}
 }
 

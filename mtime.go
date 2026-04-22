@@ -1,6 +1,7 @@
 package mtime
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -8,9 +9,11 @@ import (
 	"time"
 )
 
+var errAddSolsOutOfRange = errors.New("mtime: AddSols out of range")
+
 const (
 	// Version is the current package semantic version.
-	Version = "v0.1.0"
+	Version = "v0.3.0"
 	// SecondsPerSol is the length of one Martian sol in Earth seconds.
 	SecondsPerSol = 88775.244147
 	// MarsYearSols is the baseline number of sols in a Martian year.
@@ -181,12 +184,18 @@ func FromMSD(msd float64) Time {
 	}
 	adjustedNanos := roundFloatProductToInt(msd, bigSecondsPerSolNano)
 
-	ttNanos := int64(math.Round(TTMinusUTC(time.Now().UTC()) * float64(time.Second)))
-	utcNanos := new(big.Int).Sub(new(big.Int).Set(adjustedNanos), big.NewInt(ttNanos))
+	// Seed from the target MSD itself (not current wall clock), then iterate.
+	utcNanos := new(big.Int).Sub(new(big.Int).Set(adjustedNanos), bigMSDUnixOffsetNano)
+	sec, nsec, ok := splitUnixNanosBig(utcNanos)
+	if !ok {
+		panic("mtime: MSD value out of range")
+	}
+	ttNanos := int64(math.Round(TTMinusUTC(time.Unix(sec, nsec).UTC()) * float64(time.Second)))
+	utcNanos = new(big.Int).Sub(new(big.Int).Set(adjustedNanos), big.NewInt(ttNanos))
 	utcNanos.Sub(utcNanos, bigMSDUnixOffsetNano)
 
 	for range 3 {
-		sec, nsec, ok := splitUnixNanosBig(utcNanos)
+		sec, nsec, ok = splitUnixNanosBig(utcNanos)
 		if !ok {
 			panic("mtime: MSD value out of range")
 		}
@@ -196,7 +205,7 @@ func FromMSD(msd float64) Time {
 		utcNanos.Sub(utcNanos, bigMSDUnixOffsetNano)
 	}
 
-	sec, nsec, ok := splitUnixNanosBig(utcNanos)
+	sec, nsec, ok = splitUnixNanosBig(utcNanos)
 	if !ok {
 		panic("mtime: MSD value out of range")
 	}
@@ -257,37 +266,46 @@ func (t Time) Add(d time.Duration) Time {
 
 // AddSols returns a new Time after adding Martian sols.
 func (t Time) AddSols(sols float64) Time {
+	out, err := t.AddSolsSafe(sols)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+// AddSolsSafe returns a new Time after adding sols, without panicking on overflow.
+func (t Time) AddSolsSafe(sols float64) (Time, error) {
 	if math.IsNaN(sols) || math.IsInf(sols, 0) {
-		panic("mtime: AddSols out of range")
+		return Time{}, errAddSolsOutOfRange
 	}
 
 	deltaNanos := roundFloatProductToInt(sols, bigSecondsPerSolNano)
 	deltaSec, deltaNsec, ok := splitUnixNanosBig(deltaNanos)
 	if !ok {
-		panic("mtime: AddSols out of range")
+		return Time{}, errAddSolsOutOfRange
 	}
 
 	sec, secOK := addInt64Checked(t.earth.Unix(), deltaSec)
 	if !secOK {
-		panic("mtime: AddSols out of range")
+		return Time{}, errAddSolsOutOfRange
 	}
 	nsec := int64(t.earth.Nanosecond()) + deltaNsec
 	if nsec >= int64(time.Second) {
 		sec, secOK = addInt64Checked(sec, 1)
 		if !secOK {
-			panic("mtime: AddSols out of range")
+			return Time{}, errAddSolsOutOfRange
 		}
 		nsec -= int64(time.Second)
 	}
 	if nsec < 0 {
 		sec, secOK = addInt64Checked(sec, -1)
 		if !secOK {
-			panic("mtime: AddSols out of range")
+			return Time{}, errAddSolsOutOfRange
 		}
 		nsec += int64(time.Second)
 	}
 
-	return FromUnix(sec, nsec)
+	return FromUnix(sec, nsec), nil
 }
 
 // Sub returns the Earth duration between two Martian instants.

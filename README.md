@@ -2,6 +2,11 @@
  [![Go Report Card](https://goreportcard.com/badge/github.com/sibexico/mtime)](https://goreportcard.com/report/github.com/sibexico/mtime)
  [![Support Me](https://img.shields.io/badge/Support-Me-darkgreen?labelColor=black&logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI0ZGRiIgZmlsbC1ydWxlPSJldmVub2RkIiBjbGlwLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xMiAxQzUuOTI1IDEgMSA1LjkyNSAxIDEyczQuOTI1IDExIDExIDExIDExLTQuOTI1IDExLTExUzE4LjA3NSAxIDEyIDF6bTAgNGwyLjUgNi41SDIxbC01LjUgNCAyIDYuNUwxMiAxNy41IDYgMjJsMi02LjUtNS41LTRoNi41TDEyIDV6Ii8%2BPC9zdmc%2B)](https://sibexi.co/support)
 
+[![Tests passed](https://img.shields.io/badge/Tests-Unknown-lightgray?labelColor=gray&logo=github)](https://github.com/sibexico/mtime/actions)
+ [![Tests coverage](https://img.shields.io/badge/Tests%20Coverage-Unknown-lightgray?labelColor=gray&logo=gitextensions)](https://github.com/sibexico/mtime/actions)
+ 
+
+
 # mtime
 
 Compact Go package for working with Martian time and date.
@@ -9,6 +14,8 @@ Compact Go package for working with Martian time and date.
 It stores instants in Earth UTC and exposes Mars Sol Date (MSD), Mars Coordinated Time (MTC), and a compact Martian calendar date.
 
 Use it when you want Earth/Mars conversions but still keep familiar time-style operations.
+
+**Note about leap seconds:** the built-in leap-second table currently includes data through 2017. If a new leap second is announced, update the table in code or show your own via SetTTMinusUTCProvider.
 
 
 **Install:**
@@ -66,6 +73,19 @@ fmt.Println("window:", landingWindow)
 fmt.Println("sols from start:", landingWindow.DiffSols(start))
 fmt.Println("duration:", landingWindow.Sub(start))
 fmt.Println("after start:", landingWindow.After(start))
+```
+
+### Safe sol addition (no panic)
+
+If input can be untrusted or large, use AddSolsSafe then.
+
+```go
+result, err := mtime.Now().AddSolsSafe(userInputSols)
+if err != nil {
+	log.Printf("bad sols value: %v", err)
+	return
+}
+fmt.Println(result)
 ```
 
 
