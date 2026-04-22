@@ -2,16 +2,14 @@ name: Release Tests and Badge Update
 
 on:
   release:
-    types: [created, published]
-  push:
-    tags:
-      - "v*"
+    types: [published]
 
 permissions:
   contents: write
 
 jobs:
   test-and-update-badges:
+    if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
 
     steps:
@@ -66,8 +64,22 @@ jobs:
           test_badge="https://img.shields.io/badge/Tests-${test_status}-${test_color}?labelColor=gray&logo=github"
           coverage_badge="https://img.shields.io/badge/Tests%20Coverage-${coverage_label}-${coverage_color}?labelColor=gray&logo=gitextensions"
 
-          sed -E -i "s|^.*\[Tests passed\].*$|[![Tests passed](${test_badge})](${RUN_URL})|" README.md
-          sed -E -i "s|^.*\[Tests coverage\].*$|[![Tests coverage](${coverage_badge})](${RUN_URL})|" README.md
+          test_line="[![Tests passed](${test_badge})](${RUN_URL})"
+          coverage_line=" [![Tests coverage](${coverage_badge})](${RUN_URL})"
+
+          awk -v test_line="$test_line" -v coverage_line="$coverage_line" '
+            {
+              if ($0 ~ /\[Tests passed\]/) {
+                print test_line
+                next
+              }
+              if ($0 ~ /\[Tests coverage\]/) {
+                print coverage_line
+                next
+              }
+              print
+            }
+          ' README.md > README.tmp && mv README.tmp README.md
 
           echo "test_status=${test_status}" >> "$GITHUB_OUTPUT"
           echo "coverage=${coverage}" >> "$GITHUB_OUTPUT"
