@@ -2,7 +2,10 @@ name: Release Tests and Badge Update
 
 on:
   release:
-    types: [published]
+    types: [created, published]
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -63,8 +66,8 @@ jobs:
           test_badge="https://img.shields.io/badge/Tests-${test_status}-${test_color}?labelColor=gray&logo=github"
           coverage_badge="https://img.shields.io/badge/Tests%20Coverage-${coverage_label}-${coverage_color}?labelColor=gray&logo=gitextensions"
 
-          sed -E -i "s|^[[:space:]]*!\\[Tests passed\\].*$|[![Tests passed](${test_badge})](${RUN_URL})|" README.md
-          sed -E -i "s|^[[:space:]]*!\\[Tests coverage\\].*$|[![Tests coverage](${coverage_badge})](${RUN_URL})|" README.md
+          sed -E -i "s|^.*\[Tests passed\].*$|[![Tests passed](${test_badge})](${RUN_URL})|" README.md
+          sed -E -i "s|^.*\[Tests coverage\].*$|[![Tests coverage](${coverage_badge})](${RUN_URL})|" README.md
 
           echo "test_status=${test_status}" >> "$GITHUB_OUTPUT"
           echo "coverage=${coverage}" >> "$GITHUB_OUTPUT"
