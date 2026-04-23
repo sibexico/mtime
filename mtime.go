@@ -1,15 +1,31 @@
 package mtime
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-var errAddSolsOutOfRange = errors.New("mtime: AddSols out of range")
+var (
+	// ErrInvalidSols reports a NaN or infinite sols input.
+	ErrInvalidSols = errors.New("mtime: sols value is NaN or infinite")
+	// ErrInvalidMSD reports a NaN or infinite MSD input.
+	ErrInvalidMSD = errors.New("mtime: invalid MSD value")
+	// ErrOutOfRange reports values outside representable time range.
+	ErrOutOfRange = errors.New("mtime: result is out of representable range")
+	// ErrInvalidFormat reports parsing/formatting input that cannot be decoded.
+	ErrInvalidFormat = errors.New("mtime: invalid time format")
+)
+
+const defaultStringLayout = "MY%04d-%02d-%02d S%03d %02d:%02d:%02d.%03d MTC"
 
 const (
 	// Version is the current package semantic version.
@@ -24,7 +40,6 @@ const (
 	julianUnixEpoch = 2440587.5
 	// MSD epoch in Julian Date TT (Allison & McEwen 2000, NASA Mars24 convention).
 	msdEpochJDTT       = 2405522.0028779
-	msdRatio           = 1.0274912517
 	leapSolNumerator   = 5921
 	leapSolDenominator = 10000
 )
@@ -108,7 +123,12 @@ var preLeapDrift = [...]preLeapDriftEntry{
 var (
 	ttOffsetMu       sync.RWMutex
 	ttOffsetProvider TTMinusUTCProvider = defaultTTMinusUTC
+	leapWarnOnce     sync.Once
 )
+
+// LastLeapSecondDate is the latest date in the built-in leap-second table.
+// Times at or after this date may be off if additional leap seconds exist.
+var LastLeapSecondDate = leapSeconds[len(leapSeconds)-1].at
 
 // Time is a Mars-aware instant backed by an Earth UTC timestamp.
 type Time struct {
@@ -179,37 +199,43 @@ func FromUnix(sec int64, nsec int64) Time {
 
 // FromMSD builds a Martian time from a Mars Sol Date value.
 func FromMSD(msd float64) Time {
+	out, err := FromMSDSafe(msd)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+// FromMSDSafe builds a Martian time from a Mars Sol Date value without panic.
+func FromMSDSafe(msd float64) (Time, error) {
 	if math.IsNaN(msd) || math.IsInf(msd, 0) {
-		panic("mtime: invalid MSD value")
+		return Time{}, ErrInvalidMSD
 	}
 	adjustedNanos := roundFloatProductToInt(msd, bigSecondsPerSolNano)
 
-	// Seed from the target MSD itself (not current wall clock), then iterate.
+	// Seed from the target MSD itself and iteratively account for TT-UTC.
 	utcNanos := new(big.Int).Sub(new(big.Int).Set(adjustedNanos), bigMSDUnixOffsetNano)
-	sec, nsec, ok := splitUnixNanosBig(utcNanos)
-	if !ok {
-		panic("mtime: MSD value out of range")
-	}
-	ttNanos := int64(math.Round(TTMinusUTC(time.Unix(sec, nsec).UTC()) * float64(time.Second)))
-	utcNanos = new(big.Int).Sub(new(big.Int).Set(adjustedNanos), big.NewInt(ttNanos))
-	utcNanos.Sub(utcNanos, bigMSDUnixOffsetNano)
-
-	for range 3 {
-		sec, nsec, ok = splitUnixNanosBig(utcNanos)
+	for range 5 {
+		prev := new(big.Int).Set(utcNanos)
+		sec, nsec, ok := splitUnixNanosBig(utcNanos)
 		if !ok {
-			panic("mtime: MSD value out of range")
+			return Time{}, ErrOutOfRange
 		}
 		instant := time.Unix(sec, nsec).UTC()
-		ttNanos = int64(math.Round(TTMinusUTC(instant) * float64(time.Second)))
-		utcNanos = new(big.Int).Sub(new(big.Int).Set(adjustedNanos), big.NewInt(ttNanos))
-		utcNanos.Sub(utcNanos, bigMSDUnixOffsetNano)
+		ttNanos := int64(math.Round(TTMinusUTC(instant) * float64(time.Second)))
+		next := new(big.Int).Sub(new(big.Int).Set(adjustedNanos), big.NewInt(ttNanos))
+		next.Sub(next, bigMSDUnixOffsetNano)
+		utcNanos = next
+		if prev.Cmp(utcNanos) == 0 {
+			break
+		}
 	}
 
-	sec, nsec, ok = splitUnixNanosBig(utcNanos)
+	sec, nsec, ok := splitUnixNanosBig(utcNanos)
 	if !ok {
-		panic("mtime: MSD value out of range")
+		return Time{}, ErrOutOfRange
 	}
-	return FromUnix(sec, nsec)
+	return FromUnix(sec, nsec), nil
 }
 
 // Earth returns the Earth UTC timestamp for this Martian instant.
@@ -226,7 +252,7 @@ func (t Time) MSD() float64 {
 // MTC returns Mars coordinated time for this instant.
 func (t Time) MTC() Clock {
 	_, rem := splitMSD(t.earth)
-	ms := int((rem*86400000 + secondsPerSolNanos/2) / secondsPerSolNanos)
+	ms := int(math.Round(float64(rem) * 86400000.0 / float64(secondsPerSolNanos)))
 	if ms >= 86400000 {
 		ms = 0
 	}
@@ -276,31 +302,31 @@ func (t Time) AddSols(sols float64) Time {
 // AddSolsSafe returns a new Time after adding sols, without panicking on overflow.
 func (t Time) AddSolsSafe(sols float64) (Time, error) {
 	if math.IsNaN(sols) || math.IsInf(sols, 0) {
-		return Time{}, errAddSolsOutOfRange
+		return Time{}, ErrInvalidSols
 	}
 
 	deltaNanos := roundFloatProductToInt(sols, bigSecondsPerSolNano)
 	deltaSec, deltaNsec, ok := splitUnixNanosBig(deltaNanos)
 	if !ok {
-		return Time{}, errAddSolsOutOfRange
+		return Time{}, ErrOutOfRange
 	}
 
 	sec, secOK := addInt64Checked(t.earth.Unix(), deltaSec)
 	if !secOK {
-		return Time{}, errAddSolsOutOfRange
+		return Time{}, ErrOutOfRange
 	}
 	nsec := int64(t.earth.Nanosecond()) + deltaNsec
 	if nsec >= int64(time.Second) {
 		sec, secOK = addInt64Checked(sec, 1)
 		if !secOK {
-			return Time{}, errAddSolsOutOfRange
+			return Time{}, ErrOutOfRange
 		}
 		nsec -= int64(time.Second)
 	}
 	if nsec < 0 {
 		sec, secOK = addInt64Checked(sec, -1)
 		if !secOK {
-			return Time{}, errAddSolsOutOfRange
+			return Time{}, ErrOutOfRange
 		}
 		nsec += int64(time.Second)
 	}
@@ -337,7 +363,143 @@ func (t Time) Equal(u Time) bool {
 func (t Time) String() string {
 	d := t.Date()
 	c := t.MTC()
-	return fmt.Sprintf("MY%04d-%02d-%02d S%03d %02d:%02d:%02d.%03d MTC", d.Year, d.Month, d.Day, d.SolOfYear, c.Hour, c.Minute, c.Second, c.Millisecond)
+	return fmt.Sprintf(defaultStringLayout, d.Year, d.Month, d.Day, d.SolOfYear, c.Hour, c.Minute, c.Second, c.Millisecond)
+}
+
+// AppendFormat appends the formatted representation of t to b.
+// Tokens: MY MM DD SSS hh mm ss fff.
+func (t Time) AppendFormat(b []byte, layout string) []byte {
+	return append(b, t.Format(layout)...)
+}
+
+// Format returns a string formatted with custom tokens.
+// Tokens: MY MM DD SSS hh mm ss fff.
+func (t Time) Format(layout string) string {
+	d := t.Date()
+	c := t.MTC()
+	r := strings.NewReplacer(
+		"SSS", fmt.Sprintf("%03d", d.SolOfYear),
+		"fff", fmt.Sprintf("%03d", c.Millisecond),
+		"MY", fmt.Sprintf("%04d", d.Year),
+		"MM", fmt.Sprintf("%02d", d.Month),
+		"DD", fmt.Sprintf("%02d", d.Day),
+		"hh", fmt.Sprintf("%02d", c.Hour),
+		"mm", fmt.Sprintf("%02d", c.Minute),
+		"ss", fmt.Sprintf("%02d", c.Second),
+	)
+	return r.Replace(layout)
+}
+
+// Parse parses a Martian time from layout and value.
+// Tokens: MY MM DD SSS hh mm ss fff.
+func Parse(layout, value string) (Time, error) {
+	tokens := []string{"SSS", "fff", "MY", "MM", "DD", "hh", "mm", "ss"}
+	patterns := map[string]string{
+		"MY":  `(-?[0-9]+)`,
+		"MM":  `([0-9]{2})`,
+		"DD":  `([0-9]{2})`,
+		"SSS": `([0-9]{3})`,
+		"hh":  `([0-9]{2})`,
+		"mm":  `([0-9]{2})`,
+		"ss":  `([0-9]{2})`,
+		"fff": `([0-9]{3})`,
+	}
+
+	var order []string
+	var sb strings.Builder
+	sb.WriteString("^")
+	for i := 0; i < len(layout); {
+		matched := ""
+		for _, token := range tokens {
+			if strings.HasPrefix(layout[i:], token) {
+				matched = token
+				break
+			}
+		}
+		if matched != "" {
+			sb.WriteString(patterns[matched])
+			order = append(order, matched)
+			i += len(matched)
+			continue
+		}
+		sb.WriteString(regexp.QuoteMeta(layout[i : i+1]))
+		i++
+	}
+	sb.WriteString("$")
+
+	re, err := regexp.Compile(sb.String())
+	if err != nil {
+		return Time{}, fmt.Errorf("%w: %v", ErrInvalidFormat, err)
+	}
+	matches := re.FindStringSubmatch(value)
+	if matches == nil {
+		return Time{}, fmt.Errorf("%w: value does not match layout", ErrInvalidFormat)
+	}
+
+	vals := map[string]int{}
+	for i, token := range order {
+		n, convErr := strconv.Atoi(matches[i+1])
+		if convErr != nil {
+			return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+		}
+		vals[token] = n
+	}
+
+	required := []string{"MY", "MM", "DD", "hh", "mm", "ss", "fff"}
+	for _, token := range required {
+		if _, ok := vals[token]; !ok {
+			return Time{}, fmt.Errorf("%w: missing token %s", ErrInvalidFormat, token)
+		}
+	}
+
+	return timeFromCalendar(vals["MY"], vals["MM"], vals["DD"], vals["hh"], vals["mm"], vals["ss"], vals["fff"], vals["SSS"])
+}
+
+// ParseDefault parses the fixed String() representation.
+func ParseDefault(s string) (Time, error) {
+	var year, month, day, solOfYear, hour, minute, second, millisecond int
+	n, err := fmt.Sscanf(strings.TrimSpace(s), "MY%d-%d-%d S%d %d:%d:%d.%d MTC", &year, &month, &day, &solOfYear, &hour, &minute, &second, &millisecond)
+	if err != nil || n != 8 {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	return timeFromCalendar(year, month, day, hour, minute, second, millisecond, solOfYear)
+}
+
+// MarshalText implements encoding.TextMarshaler.
+func (t Time) MarshalText() ([]byte, error) {
+	return []byte(t.String()), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (t *Time) UnmarshalText(data []byte) error {
+	parsed, err := ParseDefault(string(data))
+	if err != nil {
+		return err
+	}
+	*t = parsed
+	return nil
+}
+
+// MarshalJSON encodes Time as UTC nanoseconds for stable round trips.
+func (t Time) MarshalJSON() ([]byte, error) {
+	payload := struct {
+		UTCNS int64 `json:"utc_ns"`
+	}{
+		UTCNS: t.earth.UnixNano(),
+	}
+	return json.Marshal(payload)
+}
+
+// UnmarshalJSON decodes Time from UTC nanoseconds.
+func (t *Time) UnmarshalJSON(data []byte) error {
+	var payload struct {
+		UTCNS int64 `json:"utc_ns"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+	*t = FromEarth(time.Unix(0, payload.UTCNS).UTC())
+	return nil
 }
 
 // String formats the Martian date.
@@ -483,6 +645,11 @@ func defaultTTMinusUTC(at time.Time) float64 {
 		}
 		deltaAT = entry.deltaAT
 	}
+	if !at.Before(LastLeapSecondDate) {
+		leapWarnOnce.Do(func() {
+			fmt.Fprintf(os.Stderr, "mtime: time %s is past the built-in leap second table (%s); consider SetTTMinusUTCProvider\n", at.Format(time.RFC3339), LastLeapSecondDate.Format(time.RFC3339))
+		})
+	}
 	return deltaAT + 32.184
 }
 
@@ -515,4 +682,44 @@ func addInt64Checked(a int64, b int64) (int64, bool) {
 		return 0, false
 	}
 	return a + b, true
+}
+
+func timeFromCalendar(year, month, day, hour, minute, second, millisecond, solOfYear int) (Time, error) {
+	if year <= 0 {
+		return Time{}, fmt.Errorf("%w: year must be positive", ErrInvalidFormat)
+	}
+	if month < 1 || month > len(monthLengths) {
+		return Time{}, fmt.Errorf("%w: month out of range", ErrInvalidFormat)
+	}
+	if hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 || millisecond < 0 || millisecond > 999 {
+		return Time{}, fmt.Errorf("%w: clock value out of range", ErrInvalidFormat)
+	}
+
+	leapYear := isLeapYear(year)
+	maxDay := monthLengths[month-1]
+	if leapYear && month == len(monthLengths) {
+		maxDay++
+	}
+	if day < 1 || day > maxDay {
+		return Time{}, fmt.Errorf("%w: day out of range", ErrInvalidFormat)
+	}
+
+	solOfYear0 := 0
+	for i := 0; i < month-1; i++ {
+		length := monthLengths[i]
+		if leapYear && i == len(monthLengths)-1 {
+			length++
+		}
+		solOfYear0 += length
+	}
+	solOfYear0 += day - 1
+	computedSolOfYear := solOfYear0 + 1
+	if solOfYear != 0 && solOfYear != computedSolOfYear {
+		return Time{}, fmt.Errorf("%w: sol-of-year does not match date", ErrInvalidFormat)
+	}
+
+	millisOfDay := ((hour*60+minute)*60+second)*1000 + millisecond
+	solNumber := solsBeforeYear(int64(year)) + int64(solOfYear0)
+	msd := float64(solNumber) + float64(millisOfDay)/86400000.0
+	return FromMSDSafe(msd)
 }

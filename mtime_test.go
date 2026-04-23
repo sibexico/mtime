@@ -1,6 +1,8 @@
 package mtime
 
 import (
+	"encoding/json"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -94,6 +96,31 @@ func TestMSDRoundTripExtremeDates(t *testing.T) {
 	}
 }
 
+func TestFromMSDSafeInvalid(t *testing.T) {
+	if _, err := FromMSDSafe(math.NaN()); !errors.Is(err, ErrInvalidMSD) {
+		t.Fatalf("expected ErrInvalidMSD for NaN, got %v", err)
+	}
+	if _, err := FromMSDSafe(math.Inf(1)); !errors.Is(err, ErrInvalidMSD) {
+		t.Fatalf("expected ErrInvalidMSD for Inf, got %v", err)
+	}
+}
+
+func TestFromMSDSafeRoundTrip(t *testing.T) {
+	base := time.Date(2026, 4, 18, 12, 34, 56, 123456000, time.UTC)
+	m := FromEarth(base)
+	round, err := FromMSDSafe(m.MSD())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	delta := round.Earth().Sub(base)
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > 2*time.Millisecond {
+		t.Fatalf("MSD safe round-trip drift too large: %v", delta)
+	}
+}
+
 func TestAddSolsSafe(t *testing.T) {
 	start := FromEarth(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	next, err := start.AddSolsSafe(1)
@@ -108,8 +135,15 @@ func TestAddSolsSafe(t *testing.T) {
 
 func TestAddSolsSafeOverflow(t *testing.T) {
 	start := FromEarth(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
-	if _, err := start.AddSolsSafe(math.MaxFloat64); err == nil {
-		t.Fatal("expected overflow error")
+	if _, err := start.AddSolsSafe(math.MaxFloat64); !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("expected ErrOutOfRange, got %v", err)
+	}
+}
+
+func TestAddSolsSafeInvalid(t *testing.T) {
+	start := FromEarth(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if _, err := start.AddSolsSafe(math.NaN()); !errors.Is(err, ErrInvalidSols) {
+		t.Fatalf("expected ErrInvalidSols, got %v", err)
 	}
 }
 
@@ -213,5 +247,83 @@ func TestAddSolsLargeRange(t *testing.T) {
 	}
 	if delta > 2*time.Millisecond {
 		t.Fatalf("unexpected AddSols large-range drift: %v", delta)
+	}
+}
+
+func TestParseDefaultRoundTrip(t *testing.T) {
+	base := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789000000, time.UTC))
+	s := base.String()
+	parsed, err := ParseDefault(s)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	delta := parsed.Earth().Sub(base.Earth())
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > 2*time.Millisecond {
+		t.Fatalf("default parse round-trip drift too large: %v", delta)
+	}
+}
+
+func TestFormatParse(t *testing.T) {
+	base := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789000000, time.UTC))
+	layout := "MY-MM-DD SSS hh:mm:ss.fff"
+	v := base.Format(layout)
+	parsed, err := Parse(layout, v)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	delta := parsed.Earth().Sub(base.Earth())
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > 2*time.Millisecond {
+		t.Fatalf("format/parse round-trip drift too large: %v", delta)
+	}
+}
+
+func TestMarshalUnmarshalText(t *testing.T) {
+	base := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789000000, time.UTC))
+	b, err := base.MarshalText()
+	if err != nil {
+		t.Fatalf("marshal text failed: %v", err)
+	}
+
+	var parsed Time
+	if err := parsed.UnmarshalText(b); err != nil {
+		t.Fatalf("unmarshal text failed: %v", err)
+	}
+
+	delta := parsed.Earth().Sub(base.Earth())
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > 2*time.Millisecond {
+		t.Fatalf("text marshal round-trip drift too large: %v", delta)
+	}
+}
+
+func TestMarshalUnmarshalJSON(t *testing.T) {
+	base := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789123000, time.UTC))
+	b, err := json.Marshal(base)
+	if err != nil {
+		t.Fatalf("marshal json failed: %v", err)
+	}
+
+	var parsed Time
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		t.Fatalf("unmarshal json failed: %v", err)
+	}
+	if !parsed.Earth().Equal(base.Earth()) {
+		t.Fatalf("json marshal should preserve nanoseconds: got=%v want=%v", parsed.Earth(), base.Earth())
+	}
+}
+
+func BenchmarkMSD(b *testing.B) {
+	timeVal := Now()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = timeVal.MSD()
 	}
 }
