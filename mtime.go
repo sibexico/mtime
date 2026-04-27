@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,7 +125,13 @@ var (
 	ttOffsetMu       sync.RWMutex
 	ttOffsetProvider TTMinusUTCProvider = defaultTTMinusUTC
 	leapWarnOnce     sync.Once
+	parseLayoutCache sync.Map
 )
+
+type compiledParseLayout struct {
+	re    *regexp.Regexp
+	order []string
+}
 
 // LastLeapSecondDate is the latest date in the built-in leap-second table.
 // Times at or after this date may be off if additional leap seconds exist.
@@ -341,7 +348,7 @@ func (t Time) Sub(u Time) time.Duration {
 
 // DiffSols returns the time difference between two instants in sols.
 func (t Time) DiffSols(u Time) float64 {
-	return t.Sub(u).Seconds() / SecondsPerSol
+	return float64(t.Sub(u).Nanoseconds()) / float64(secondsPerSolNanos)
 }
 
 // Before reports whether t happens before u.
@@ -377,67 +384,67 @@ func (t Time) AppendFormat(b []byte, layout string) []byte {
 func (t Time) Format(layout string) string {
 	d := t.Date()
 	c := t.MTC()
-	r := strings.NewReplacer(
-		"SSS", fmt.Sprintf("%03d", d.SolOfYear),
-		"fff", fmt.Sprintf("%03d", c.Millisecond),
-		"MY", fmt.Sprintf("%04d", d.Year),
-		"MM", fmt.Sprintf("%02d", d.Month),
-		"DD", fmt.Sprintf("%02d", d.Day),
-		"hh", fmt.Sprintf("%02d", c.Hour),
-		"mm", fmt.Sprintf("%02d", c.Minute),
-		"ss", fmt.Sprintf("%02d", c.Second),
-	)
-	return r.Replace(layout)
+	my := fmt.Sprintf("%04d", d.Year)
+	month := fmt.Sprintf("%02d", d.Month)
+	day := fmt.Sprintf("%02d", d.Day)
+	sol := fmt.Sprintf("%03d", d.SolOfYear)
+	hour := fmt.Sprintf("%02d", c.Hour)
+	minute := fmt.Sprintf("%02d", c.Minute)
+	second := fmt.Sprintf("%02d", c.Second)
+	millisecond := fmt.Sprintf("%03d", c.Millisecond)
+
+	var b strings.Builder
+	b.Grow(len(layout) + 16)
+	for i := 0; i < len(layout); {
+		switch {
+		case strings.HasPrefix(layout[i:], "SSS"):
+			b.WriteString(sol)
+			i += 3
+		case strings.HasPrefix(layout[i:], "fff"):
+			b.WriteString(millisecond)
+			i += 3
+		case strings.HasPrefix(layout[i:], "MY"):
+			b.WriteString(my)
+			i += 2
+		case strings.HasPrefix(layout[i:], "MM"):
+			b.WriteString(month)
+			i += 2
+		case strings.HasPrefix(layout[i:], "DD"):
+			b.WriteString(day)
+			i += 2
+		case strings.HasPrefix(layout[i:], "hh"):
+			b.WriteString(hour)
+			i += 2
+		case strings.HasPrefix(layout[i:], "mm"):
+			b.WriteString(minute)
+			i += 2
+		case strings.HasPrefix(layout[i:], "ss"):
+			b.WriteString(second)
+			i += 2
+		default:
+			b.WriteByte(layout[i])
+			i++
+		}
+	}
+
+	return b.String()
 }
 
 // Parse parses a Martian time from layout and value.
 // Tokens: MY MM DD SSS hh mm ss fff.
 func Parse(layout, value string) (Time, error) {
-	tokens := []string{"SSS", "fff", "MY", "MM", "DD", "hh", "mm", "ss"}
-	patterns := map[string]string{
-		"MY":  `(-?[0-9]+)`,
-		"MM":  `([0-9]{2})`,
-		"DD":  `([0-9]{2})`,
-		"SSS": `([0-9]{3})`,
-		"hh":  `([0-9]{2})`,
-		"mm":  `([0-9]{2})`,
-		"ss":  `([0-9]{2})`,
-		"fff": `([0-9]{3})`,
-	}
-
-	var order []string
-	var sb strings.Builder
-	sb.WriteString("^")
-	for i := 0; i < len(layout); {
-		matched := ""
-		for _, token := range tokens {
-			if strings.HasPrefix(layout[i:], token) {
-				matched = token
-				break
-			}
-		}
-		if matched != "" {
-			sb.WriteString(patterns[matched])
-			order = append(order, matched)
-			i += len(matched)
-			continue
-		}
-		sb.WriteString(regexp.QuoteMeta(layout[i : i+1]))
-		i++
-	}
-	sb.WriteString("$")
-
-	re, err := regexp.Compile(sb.String())
+	compiled, err := getCompiledParseLayout(layout)
 	if err != nil {
-		return Time{}, fmt.Errorf("%w: %v", ErrInvalidFormat, err)
+		return Time{}, err
 	}
-	matches := re.FindStringSubmatch(value)
+
+	matches := compiled.re.FindStringSubmatch(value)
 	if matches == nil {
 		return Time{}, fmt.Errorf("%w: value does not match layout", ErrInvalidFormat)
 	}
 
 	vals := map[string]int{}
-	for i, token := range order {
+	for i, token := range compiled.order {
 		n, convErr := strconv.Atoi(matches[i+1])
 		if convErr != nil {
 			return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
@@ -576,6 +583,15 @@ func solsBeforeYear(year int64) int64 {
 
 func splitMSD(utc time.Time) (sol int64, rem int64) {
 	ttNanos := int64(math.Round(TTMinusUTC(utc) * float64(time.Second)))
+	if totalNanos, ok := unixToTotalNanos(utc.Unix(), int64(utc.Nanosecond()), ttNanos, msdUnixOffsetNanos); ok {
+		sol = totalNanos / secondsPerSolNanos
+		rem = totalNanos % secondsPerSolNanos
+		if rem < 0 {
+			sol--
+			rem += secondsPerSolNanos
+		}
+		return sol, rem
+	}
 
 	utcNanos := new(big.Int).Mul(big.NewInt(utc.Unix()), bigNanosPerSecond)
 	utcNanos.Add(utcNanos, big.NewInt(int64(utc.Nanosecond())))
@@ -627,24 +643,18 @@ func defaultTTMinusUTC(at time.Time) float64 {
 		return 32.184
 	}
 	if at.Before(leapSeconds[0].at) {
-		entry := preLeapDrift[0]
-		for _, candidate := range preLeapDrift {
-			if at.Before(candidate.at) {
-				break
-			}
-			entry = candidate
-		}
+		idx := sort.Search(len(preLeapDrift), func(i int) bool {
+			return preLeapDrift[i].at.After(at)
+		})
+		entry := preLeapDrift[idx-1]
 		mjd := modifiedJulianDate(at)
 		deltaAT := entry.delta + (mjd-entry.refMJD)*entry.drift
 		return deltaAT + 32.184
 	}
-	deltaAT := leapSeconds[0].deltaAT
-	for _, entry := range leapSeconds {
-		if at.Before(entry.at) {
-			break
-		}
-		deltaAT = entry.deltaAT
-	}
+	idx := sort.Search(len(leapSeconds), func(i int) bool {
+		return leapSeconds[i].at.After(at)
+	})
+	deltaAT := leapSeconds[idx-1].deltaAT
 	if !at.Before(LastLeapSecondDate) {
 		leapWarnOnce.Do(func() {
 			fmt.Fprintf(os.Stderr, "mtime: time %s is past the built-in leap second table (%s); consider SetTTMinusUTCProvider\n", at.Format(time.RFC3339), LastLeapSecondDate.Format(time.RFC3339))
@@ -682,6 +692,108 @@ func addInt64Checked(a int64, b int64) (int64, bool) {
 		return 0, false
 	}
 	return a + b, true
+}
+
+func mulInt64Checked(a int64, b int64) (int64, bool) {
+	if a == 0 || b == 0 {
+		return 0, true
+	}
+	if a == math.MinInt64 && b == -1 {
+		return 0, false
+	}
+	if b == math.MinInt64 && a == -1 {
+		return 0, false
+	}
+	if a > 0 {
+		if b > 0 {
+			if a > math.MaxInt64/b {
+				return 0, false
+			}
+		} else {
+			if b < math.MinInt64/a {
+				return 0, false
+			}
+		}
+	} else {
+		if b > 0 {
+			if a < math.MinInt64/b {
+				return 0, false
+			}
+		} else {
+			if a != 0 && b < math.MaxInt64/a {
+				return 0, false
+			}
+		}
+	}
+	return a * b, true
+}
+
+func unixToTotalNanos(sec, nsec, ttNanos, offset int64) (int64, bool) {
+	total, ok := mulInt64Checked(sec, int64(time.Second))
+	if !ok {
+		return 0, false
+	}
+	total, ok = addInt64Checked(total, nsec)
+	if !ok {
+		return 0, false
+	}
+	total, ok = addInt64Checked(total, ttNanos)
+	if !ok {
+		return 0, false
+	}
+	total, ok = addInt64Checked(total, offset)
+	if !ok {
+		return 0, false
+	}
+	return total, true
+}
+
+func getCompiledParseLayout(layout string) (compiledParseLayout, error) {
+	if cached, ok := parseLayoutCache.Load(layout); ok {
+		return cached.(compiledParseLayout), nil
+	}
+
+	tokens := []string{"SSS", "fff", "MY", "MM", "DD", "hh", "mm", "ss"}
+	patterns := map[string]string{
+		"MY":  `(-?[0-9]+)`,
+		"MM":  `([0-9]{2})`,
+		"DD":  `([0-9]{2})`,
+		"SSS": `([0-9]{3})`,
+		"hh":  `([0-9]{2})`,
+		"mm":  `([0-9]{2})`,
+		"ss":  `([0-9]{2})`,
+		"fff": `([0-9]{3})`,
+	}
+
+	order := make([]string, 0, 8)
+	var sb strings.Builder
+	sb.WriteString("^")
+	for i := 0; i < len(layout); {
+		matched := ""
+		for _, token := range tokens {
+			if strings.HasPrefix(layout[i:], token) {
+				matched = token
+				break
+			}
+		}
+		if matched != "" {
+			sb.WriteString(patterns[matched])
+			order = append(order, matched)
+			i += len(matched)
+			continue
+		}
+		sb.WriteString(regexp.QuoteMeta(layout[i : i+1]))
+		i++
+	}
+	sb.WriteString("$")
+
+	re, err := regexp.Compile(sb.String())
+	if err != nil {
+		return compiledParseLayout{}, fmt.Errorf("%w: %v", ErrInvalidFormat, err)
+	}
+	compiled := compiledParseLayout{re: re, order: order}
+	actual, _ := parseLayoutCache.LoadOrStore(layout, compiled)
+	return actual.(compiledParseLayout), nil
 }
 
 func timeFromCalendar(year, month, day, hour, minute, second, millisecond, solOfYear int) (Time, error) {

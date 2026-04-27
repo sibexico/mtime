@@ -103,10 +103,11 @@ fmt.Println(result)
 ### Parse and format Martian timestamps
 
 ```go
-now := mtime.Now()
+// Use millisecond-aligned input because fff token has millisecond precision.
+base := mtime.FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789000000, time.UTC))
 
 // Fixed default format used by Time.String().
-raw := now.String()
+raw := base.String()
 parsed, err := mtime.ParseDefault(raw)
 if err != nil {
 	log.Fatal(err)
@@ -114,14 +115,14 @@ if err != nil {
 
 // Custom format tokens: MY MM DD SSS hh mm ss fff
 layout := "MY-MM-DD SSS hh:mm:ss.fff"
-custom := now.Format(layout)
+custom := base.Format(layout)
 parsedCustom, err := mtime.Parse(layout, custom)
 if err != nil {
 	log.Fatal(err)
 }
 
 fmt.Println(raw)
-fmt.Println(parsed.Equal(now), parsedCustom.Equal(now))
+fmt.Println(parsed.Equal(base), parsedCustom.Equal(base))
 ```
 
 ### JSON round-trip with UTC nanoseconds
