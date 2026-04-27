@@ -8,17 +8,31 @@ permissions:
 
 jobs:
   test-and-update-badges:
-    if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
 
     steps:
+      - name: Check default branch gate
+        id: gate
+        shell: bash
+        run: |
+          default_branch="${{ github.event.repository.default_branch }}"
+          if [[ "${GITHUB_REF}" == "refs/heads/${default_branch}" ]]; then
+            echo "on_default_branch=true" >> "$GITHUB_OUTPUT"
+            echo "Running release flow on default branch: ${default_branch}"
+          else
+            echo "on_default_branch=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping release flow for ref ${GITHUB_REF}; expected refs/heads/${default_branch}."
+          fi
+
       - name: Checkout default branch
+        if: steps.gate.outputs.on_default_branch == 'true'
         uses: actions/checkout@v6
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
       - name: Detect VERSION file change and read release metadata
+        if: steps.gate.outputs.on_default_branch == 'true'
         id: release_meta
         shell: bash
         run: |
@@ -62,13 +76,13 @@ jobs:
           echo "Commit description captured for release body."
 
       - name: Setup Go
-        if: steps.release_meta.outputs.version_changed == 'true'
+        if: steps.gate.outputs.on_default_branch == 'true' && steps.release_meta.outputs.version_changed == 'true'
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Run tests with coverage
-        if: steps.release_meta.outputs.version_changed == 'true'
+        if: steps.gate.outputs.on_default_branch == 'true' && steps.release_meta.outputs.version_changed == 'true'
         id: tests
         continue-on-error: true
         shell: bash
@@ -76,7 +90,7 @@ jobs:
           go test ./... -coverprofile=coverage.out -covermode=atomic
 
       - name: Build badges and update README
-        if: steps.release_meta.outputs.version_changed == 'true'
+        if: steps.gate.outputs.on_default_branch == 'true' && steps.release_meta.outputs.version_changed == 'true'
         id: badges
         shell: bash
         env:
@@ -131,7 +145,7 @@ jobs:
           echo "coverage=${coverage}" >> "$GITHUB_OUTPUT"
 
       - name: Commit README badge updates
-        if: steps.release_meta.outputs.version_changed == 'true'
+        if: steps.gate.outputs.on_default_branch == 'true' && steps.release_meta.outputs.version_changed == 'true'
         shell: bash
         run: |
           if git diff --quiet -- README.md; then
@@ -145,7 +159,7 @@ jobs:
           fi
 
       - name: Refresh local branch after README push
-        if: steps.release_meta.outputs.version_changed == 'true'
+        if: steps.gate.outputs.on_default_branch == 'true' && steps.release_meta.outputs.version_changed == 'true'
         id: refresh
         shell: bash
         run: |
@@ -153,7 +167,7 @@ jobs:
           echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Create tagged release
-        if: steps.release_meta.outputs.version_changed == 'true' && steps.tests.outcome == 'success'
+        if: steps.gate.outputs.on_default_branch == 'true' && steps.release_meta.outputs.version_changed == 'true' && steps.tests.outcome == 'success'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.release_meta.outputs.version }}
@@ -162,7 +176,7 @@ jobs:
           body: ${{ steps.release_meta.outputs.commit_body }}
 
       - name: Fail job when tests failed
-        if: steps.release_meta.outputs.version_changed == 'true' && steps.tests.outcome != 'success'
+        if: steps.gate.outputs.on_default_branch == 'true' && steps.release_meta.outputs.version_changed == 'true' && steps.tests.outcome != 'success'
         shell: bash
         run: |
           echo "Tests failed. Badges were updated to reflect the failed run, and release was not created."

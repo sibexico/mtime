@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -213,6 +214,18 @@ func TestCompareAndDiff(t *testing.T) {
 	}
 }
 
+func TestDiffSolsMatchesRoundedSolShift(t *testing.T) {
+	start := FromEarth(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	shift := 0.123456789
+	end := start.AddSols(shift)
+
+	want := float64(int64(math.Round(shift*float64(secondsPerSolNanos)))) / float64(secondsPerSolNanos)
+	got := end.DiffSols(start)
+	if math.Abs(got-want) > 1e-15 {
+		t.Fatalf("unexpected DiffSols precision: got=%0.18f want=%0.18f", got, want)
+	}
+}
+
 func TestStringFormats(t *testing.T) {
 	m := FromMSD(0)
 	if got := m.Date().String(); got != "MY0001-01-01 (S001)" {
@@ -280,6 +293,22 @@ func TestFormatParse(t *testing.T) {
 	}
 	if delta > 2*time.Millisecond {
 		t.Fatalf("format/parse round-trip drift too large: %v", delta)
+	}
+}
+
+func TestFormatTokenMillisecondPrecision(t *testing.T) {
+	base := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789123000, time.UTC))
+	v := base.Format("fff")
+	if len(v) != 3 {
+		t.Fatalf("layout token fff must render exactly 3 digits, got %q", v)
+	}
+	if strings.Contains(v, ".") {
+		t.Fatalf("layout token fff must be digits only, got %q", v)
+	}
+	for _, ch := range v {
+		if ch < '0' || ch > '9' {
+			t.Fatalf("layout token fff must be numeric, got %q", v)
+		}
 	}
 }
 
