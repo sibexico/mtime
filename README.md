@@ -143,7 +143,7 @@ if err := json.Unmarshal(b, &out); err != nil {
 	log.Fatal(err)
 }
 
-fmt.Println(string(b)) // {"at":{"utc_ns":...}}
+fmt.Println(string(b)) // {"at":{"utc_ns":...,"unix_sec":...,"nano":...}}
 fmt.Println(out.At.Equal(in.At))
 ```
 

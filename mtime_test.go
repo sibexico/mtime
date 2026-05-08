@@ -4,16 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
-
-func TestVersion(t *testing.T) {
-	if Version != "v0.3.0" {
-		t.Fatalf("unexpected version: %q", Version)
-	}
-}
 
 func TestTTMinusUTCLeapTable(t *testing.T) {
 	before := TTMinusUTC(time.Date(2016, 12, 31, 23, 59, 59, 0, time.UTC))
@@ -349,10 +344,85 @@ func TestMarshalUnmarshalJSON(t *testing.T) {
 	}
 }
 
+func TestUnmarshalJSONLegacyUTCNSOnly(t *testing.T) {
+	base := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789123000, time.UTC))
+	legacy := []byte(`{"utc_ns":` + strconv.FormatInt(base.Earth().UnixNano(), 10) + `}`)
+
+	var parsed Time
+	if err := json.Unmarshal(legacy, &parsed); err != nil {
+		t.Fatalf("unmarshal legacy json failed: %v", err)
+	}
+	if !parsed.Earth().Equal(base.Earth()) {
+		t.Fatalf("legacy json round-trip mismatch: got=%v want=%v", parsed.Earth(), base.Earth())
+	}
+}
+
+func TestMarshalUnmarshalJSONExtremeDate(t *testing.T) {
+	base := FromEarth(time.Date(1, 1, 1, 0, 0, 0, 123456000, time.UTC))
+	b, err := json.Marshal(base)
+	if err != nil {
+		t.Fatalf("marshal json failed: %v", err)
+	}
+	if strings.Contains(string(b), `"utc_ns"`) {
+		t.Fatalf("extreme-date payload should avoid utc_ns overflow field: %s", string(b))
+	}
+
+	var parsed Time
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		t.Fatalf("unmarshal json failed: %v", err)
+	}
+	if !parsed.Earth().Equal(base.Earth()) {
+		t.Fatalf("extreme-date json round-trip mismatch: got=%v want=%v", parsed.Earth(), base.Earth())
+	}
+}
+
 func BenchmarkMSD(b *testing.B) {
 	timeVal := Now()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = timeVal.MSD()
+	}
+}
+
+func BenchmarkString(b *testing.B) {
+	timeVal := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789000000, time.UTC))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = timeVal.String()
+	}
+}
+
+func BenchmarkFormatCustom(b *testing.B) {
+	timeVal := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789000000, time.UTC))
+	layout := "MY-MM-DD SSS hh:mm:ss.fff"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = timeVal.Format(layout)
+	}
+}
+
+func BenchmarkParseDefault(b *testing.B) {
+	timeVal := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789000000, time.UTC))
+	v := timeVal.String()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = ParseDefault(v)
+	}
+}
+
+func BenchmarkMarshalJSON(b *testing.B) {
+	timeVal := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789123000, time.UTC))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = timeVal.MarshalJSON()
+	}
+}
+
+func BenchmarkUnmarshalJSON(b *testing.B) {
+	v := []byte(`{"utc_ns":1776515696789123000,"unix_sec":1776515696,"nano":789123000}`)
+	var parsed Time
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = parsed.UnmarshalJSON(v)
 	}
 }

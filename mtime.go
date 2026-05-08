@@ -29,8 +29,6 @@ var (
 const defaultStringLayout = "MY%04d-%02d-%02d S%03d %02d:%02d:%02d.%03d MTC"
 
 const (
-	// Version is the current package semantic version.
-	Version = "v0.3.0"
 	// SecondsPerSol is the length of one Martian sol in Earth seconds.
 	SecondsPerSol = 88775.244147
 	// MarsYearSols is the baseline number of sols in a Martian year.
@@ -219,7 +217,11 @@ func FromMSDSafe(msd float64) (Time, error) {
 		return Time{}, ErrInvalidMSD
 	}
 	adjustedNanos := roundFloatProductToInt(msd, bigSecondsPerSolNano)
+	return fromAdjustedMSDNanos(adjustedNanos)
+}
 
+
+func fromAdjustedMSDNanos(adjustedNanos *big.Int) (Time, error) {
 	// Seed from the target MSD itself and iteratively account for TT-UTC.
 	utcNanos := new(big.Int).Sub(new(big.Int).Set(adjustedNanos), bigMSDUnixOffsetNano)
 	for range 5 {
@@ -370,13 +372,33 @@ func (t Time) Equal(u Time) bool {
 func (t Time) String() string {
 	d := t.Date()
 	c := t.MTC()
-	return fmt.Sprintf(defaultStringLayout, d.Year, d.Month, d.Day, d.SolOfYear, c.Hour, c.Minute, c.Second, c.Millisecond)
+	b := make([]byte, 0, 40)
+	b = append(b, 'M', 'Y')
+	b = appendPaddedInt(b, d.Year, 4)
+	b = append(b, '-')
+	b = appendPaddedInt(b, d.Month, 2)
+	b = append(b, '-')
+	b = appendPaddedInt(b, d.Day, 2)
+	b = append(b, ' ', 'S')
+	b = appendPaddedInt(b, d.SolOfYear, 3)
+	b = append(b, ' ')
+	b = appendPaddedInt(b, c.Hour, 2)
+	b = append(b, ':')
+	b = appendPaddedInt(b, c.Minute, 2)
+	b = append(b, ':')
+	b = appendPaddedInt(b, c.Second, 2)
+	b = append(b, '.')
+	b = appendPaddedInt(b, c.Millisecond, 3)
+	b = append(b, ' ', 'M', 'T', 'C')
+	return string(b)
 }
 
 // AppendFormat appends the formatted representation of t to b.
 // Tokens: MY MM DD SSS hh mm ss fff.
 func (t Time) AppendFormat(b []byte, layout string) []byte {
-	return append(b, t.Format(layout)...)
+	d := t.Date()
+	c := t.MTC()
+	return appendTokenLayout(b, layout, d, c)
 }
 
 // Format returns a string formatted with custom tokens.
@@ -384,50 +406,9 @@ func (t Time) AppendFormat(b []byte, layout string) []byte {
 func (t Time) Format(layout string) string {
 	d := t.Date()
 	c := t.MTC()
-	my := fmt.Sprintf("%04d", d.Year)
-	month := fmt.Sprintf("%02d", d.Month)
-	day := fmt.Sprintf("%02d", d.Day)
-	sol := fmt.Sprintf("%03d", d.SolOfYear)
-	hour := fmt.Sprintf("%02d", c.Hour)
-	minute := fmt.Sprintf("%02d", c.Minute)
-	second := fmt.Sprintf("%02d", c.Second)
-	millisecond := fmt.Sprintf("%03d", c.Millisecond)
-
-	var b strings.Builder
-	b.Grow(len(layout) + 16)
-	for i := 0; i < len(layout); {
-		switch {
-		case strings.HasPrefix(layout[i:], "SSS"):
-			b.WriteString(sol)
-			i += 3
-		case strings.HasPrefix(layout[i:], "fff"):
-			b.WriteString(millisecond)
-			i += 3
-		case strings.HasPrefix(layout[i:], "MY"):
-			b.WriteString(my)
-			i += 2
-		case strings.HasPrefix(layout[i:], "MM"):
-			b.WriteString(month)
-			i += 2
-		case strings.HasPrefix(layout[i:], "DD"):
-			b.WriteString(day)
-			i += 2
-		case strings.HasPrefix(layout[i:], "hh"):
-			b.WriteString(hour)
-			i += 2
-		case strings.HasPrefix(layout[i:], "mm"):
-			b.WriteString(minute)
-			i += 2
-		case strings.HasPrefix(layout[i:], "ss"):
-			b.WriteString(second)
-			i += 2
-		default:
-			b.WriteByte(layout[i])
-			i++
-		}
-	}
-
-	return b.String()
+	b := make([]byte, 0, len(layout)+16)
+	b = appendTokenLayout(b, layout, d, c)
+	return string(b)
 }
 
 // Parse parses a Martian time from layout and value.
@@ -443,32 +424,145 @@ func Parse(layout, value string) (Time, error) {
 		return Time{}, fmt.Errorf("%w: value does not match layout", ErrInvalidFormat)
 	}
 
-	vals := map[string]int{}
+	var year, month, day, solOfYear, hour, minute, second, millisecond int
+	hasYear := false
+	hasMonth := false
+	hasDay := false
+	hasHour := false
+	hasMinute := false
+	hasSecond := false
+	hasMillisecond := false
 	for i, token := range compiled.order {
 		n, convErr := strconv.Atoi(matches[i+1])
 		if convErr != nil {
 			return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
 		}
-		vals[token] = n
-	}
 
-	required := []string{"MY", "MM", "DD", "hh", "mm", "ss", "fff"}
-	for _, token := range required {
-		if _, ok := vals[token]; !ok {
-			return Time{}, fmt.Errorf("%w: missing token %s", ErrInvalidFormat, token)
+		switch token {
+		case "MY":
+			year = n
+			hasYear = true
+		case "MM":
+			month = n
+			hasMonth = true
+		case "DD":
+			day = n
+			hasDay = true
+		case "SSS":
+			solOfYear = n
+		case "hh":
+			hour = n
+			hasHour = true
+		case "mm":
+			minute = n
+			hasMinute = true
+		case "ss":
+			second = n
+			hasSecond = true
+		case "fff":
+			millisecond = n
+			hasMillisecond = true
 		}
 	}
 
-	return timeFromCalendar(vals["MY"], vals["MM"], vals["DD"], vals["hh"], vals["mm"], vals["ss"], vals["fff"], vals["SSS"])
+	if !hasYear {
+		return Time{}, fmt.Errorf("%w: missing token MY", ErrInvalidFormat)
+	}
+	if !hasMonth {
+		return Time{}, fmt.Errorf("%w: missing token MM", ErrInvalidFormat)
+	}
+	if !hasDay {
+		return Time{}, fmt.Errorf("%w: missing token DD", ErrInvalidFormat)
+	}
+	if !hasHour {
+		return Time{}, fmt.Errorf("%w: missing token hh", ErrInvalidFormat)
+	}
+	if !hasMinute {
+		return Time{}, fmt.Errorf("%w: missing token mm", ErrInvalidFormat)
+	}
+	if !hasSecond {
+		return Time{}, fmt.Errorf("%w: missing token ss", ErrInvalidFormat)
+	}
+	if !hasMillisecond {
+		return Time{}, fmt.Errorf("%w: missing token fff", ErrInvalidFormat)
+	}
+
+	return timeFromCalendar(year, month, day, hour, minute, second, millisecond, solOfYear)
 }
 
 // ParseDefault parses the fixed String() representation.
 func ParseDefault(s string) (Time, error) {
-	var year, month, day, solOfYear, hour, minute, second, millisecond int
-	n, err := fmt.Sscanf(strings.TrimSpace(s), "MY%d-%d-%d S%d %d:%d:%d.%d MTC", &year, &month, &day, &solOfYear, &hour, &minute, &second, &millisecond)
-	if err != nil || n != 8 {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "MY") || !strings.HasSuffix(s, " MTC") {
 		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
 	}
+
+	body := s[2 : len(s)-4]
+	datePart, rest, ok := strings.Cut(body, " S")
+	if !ok {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+
+	yearStr, rem, ok := strings.Cut(datePart, "-")
+	if !ok {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	monthStr, dayStr, ok := strings.Cut(rem, "-")
+	if !ok {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+
+	solStr, clockPart, ok := strings.Cut(rest, " ")
+	if !ok {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+
+	hourStr, rem, ok := strings.Cut(clockPart, ":")
+	if !ok {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	minuteStr, rem, ok := strings.Cut(rem, ":")
+	if !ok {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	secondStr, milliStr, ok := strings.Cut(rem, ".")
+	if !ok {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+
+	year, err := strconv.Atoi(yearStr)
+	if err != nil {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	month, err := strconv.Atoi(monthStr)
+	if err != nil {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	day, err := strconv.Atoi(dayStr)
+	if err != nil {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	solOfYear, err := strconv.Atoi(solStr)
+	if err != nil {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	hour, err := strconv.Atoi(hourStr)
+	if err != nil {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	minute, err := strconv.Atoi(minuteStr)
+	if err != nil {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	second, err := strconv.Atoi(secondStr)
+	if err != nil {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+	millisecond, err := strconv.Atoi(milliStr)
+	if err != nil {
+		return Time{}, fmt.Errorf("%w: cannot parse default format", ErrInvalidFormat)
+	}
+
 	return timeFromCalendar(year, month, day, hour, minute, second, millisecond, solOfYear)
 }
 
@@ -489,34 +583,85 @@ func (t *Time) UnmarshalText(data []byte) error {
 
 // MarshalJSON encodes Time as UTC nanoseconds for stable round trips.
 func (t Time) MarshalJSON() ([]byte, error) {
-	payload := struct {
-		UTCNS int64 `json:"utc_ns"`
-	}{
-		UTCNS: t.earth.UnixNano(),
+	sec := t.earth.Unix()
+	nsec := t.earth.Nanosecond()
+
+	b := make([]byte, 0, 96)
+	b = append(b, '{')
+
+	if utcNS, ok := unixToTotalNanos(sec, int64(nsec), 0, 0); ok {
+		b = append(b, `"utc_ns":`...)
+		b = strconv.AppendInt(b, utcNS, 10)
+		b = append(b, ',')
 	}
-	return json.Marshal(payload)
+
+	b = append(b, `"unix_sec":`...)
+	b = strconv.AppendInt(b, sec, 10)
+	b = append(b, ',')
+	b = append(b, `"nano":`...)
+	b = strconv.AppendInt(b, int64(nsec), 10)
+	b = append(b, '}')
+
+	return b, nil
 }
 
 // UnmarshalJSON decodes Time from UTC nanoseconds.
 func (t *Time) UnmarshalJSON(data []byte) error {
 	var payload struct {
-		UTCNS int64 `json:"utc_ns"`
+		UTCNS   *int64 `json:"utc_ns"`
+		UnixSec *int64 `json:"unix_sec"`
+		Nano    *int   `json:"nano"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return err
 	}
-	*t = FromEarth(time.Unix(0, payload.UTCNS).UTC())
+
+	if payload.UTCNS != nil {
+		*t = FromEarth(time.Unix(0, *payload.UTCNS).UTC())
+		return nil
+	}
+
+	if payload.UnixSec == nil {
+		return fmt.Errorf("%w: missing unix_sec", ErrInvalidFormat)
+	}
+	nano := 0
+	if payload.Nano != nil {
+		nano = *payload.Nano
+	}
+	if nano < 0 || nano >= int(time.Second) {
+		return fmt.Errorf("%w: nano out of range", ErrInvalidFormat)
+	}
+
+	*t = FromEarth(time.Unix(*payload.UnixSec, int64(nano)).UTC())
 	return nil
 }
 
 // String formats the Martian date.
 func (d Date) String() string {
-	return fmt.Sprintf("MY%04d-%02d-%02d (S%03d)", d.Year, d.Month, d.Day, d.SolOfYear)
+	b := make([]byte, 0, 20)
+	b = append(b, 'M', 'Y')
+	b = appendPaddedInt(b, d.Year, 4)
+	b = append(b, '-')
+	b = appendPaddedInt(b, d.Month, 2)
+	b = append(b, '-')
+	b = appendPaddedInt(b, d.Day, 2)
+	b = append(b, ' ', '(', 'S')
+	b = appendPaddedInt(b, d.SolOfYear, 3)
+	b = append(b, ')')
+	return string(b)
 }
 
 // String formats Mars coordinated time.
 func (c Clock) String() string {
-	return fmt.Sprintf("%02d:%02d:%02d.%03d", c.Hour, c.Minute, c.Second, c.Millisecond)
+	b := make([]byte, 0, 12)
+	b = appendPaddedInt(b, c.Hour, 2)
+	b = append(b, ':')
+	b = appendPaddedInt(b, c.Minute, 2)
+	b = append(b, ':')
+	b = appendPaddedInt(b, c.Second, 2)
+	b = append(b, '.')
+	b = appendPaddedInt(b, c.Millisecond, 3)
+	return string(b)
 }
 
 // Since returns the Earth duration since t.
@@ -796,6 +941,50 @@ func getCompiledParseLayout(layout string) (compiledParseLayout, error) {
 	return actual.(compiledParseLayout), nil
 }
 
+func appendTokenLayout(dst []byte, layout string, d Date, c Clock) []byte {
+	for i := 0; i < len(layout); {
+		switch {
+		case strings.HasPrefix(layout[i:], "SSS"):
+			dst = appendPaddedInt(dst, d.SolOfYear, 3)
+			i += 3
+		case strings.HasPrefix(layout[i:], "fff"):
+			dst = appendPaddedInt(dst, c.Millisecond, 3)
+			i += 3
+		case strings.HasPrefix(layout[i:], "MY"):
+			dst = appendPaddedInt(dst, d.Year, 4)
+			i += 2
+		case strings.HasPrefix(layout[i:], "MM"):
+			dst = appendPaddedInt(dst, d.Month, 2)
+			i += 2
+		case strings.HasPrefix(layout[i:], "DD"):
+			dst = appendPaddedInt(dst, d.Day, 2)
+			i += 2
+		case strings.HasPrefix(layout[i:], "hh"):
+			dst = appendPaddedInt(dst, c.Hour, 2)
+			i += 2
+		case strings.HasPrefix(layout[i:], "mm"):
+			dst = appendPaddedInt(dst, c.Minute, 2)
+			i += 2
+		case strings.HasPrefix(layout[i:], "ss"):
+			dst = appendPaddedInt(dst, c.Second, 2)
+			i += 2
+		default:
+			dst = append(dst, layout[i])
+			i++
+		}
+	}
+	return dst
+}
+
+func appendPaddedInt(dst []byte, n int, width int) []byte {
+	var tmp [24]byte
+	digits := strconv.AppendInt(tmp[:0], int64(n), 10)
+	for i := len(digits); i < width; i++ {
+		dst = append(dst, '0')
+	}
+	return append(dst, digits...)
+}
+
 func timeFromCalendar(year, month, day, hour, minute, second, millisecond, solOfYear int) (Time, error) {
 	if year <= 0 {
 		return Time{}, fmt.Errorf("%w: year must be positive", ErrInvalidFormat)
@@ -832,6 +1021,15 @@ func timeFromCalendar(year, month, day, hour, minute, second, millisecond, solOf
 
 	millisOfDay := ((hour*60+minute)*60+second)*1000 + millisecond
 	solNumber := solsBeforeYear(int64(year)) + int64(solOfYear0)
-	msd := float64(solNumber) + float64(millisOfDay)/86400000.0
-	return FromMSDSafe(msd)
+
+	fracNanos := int64(math.Round(float64(millisOfDay) * float64(secondsPerSolNanos) / 86400000.0))
+	if solNanos, ok := mulInt64Checked(solNumber, secondsPerSolNanos); ok {
+		if totalNanos, ok := addInt64Checked(solNanos, fracNanos); ok {
+			return fromAdjustedMSDNanos(big.NewInt(totalNanos))
+		}
+	}
+
+	adjustedNanos := new(big.Int).Mul(big.NewInt(solNumber), bigSecondsPerSolNano)
+	adjustedNanos.Add(adjustedNanos, big.NewInt(fracNanos))
+	return fromAdjustedMSDNanos(adjustedNanos)
 }
