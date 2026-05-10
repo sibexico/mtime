@@ -1,11 +1,14 @@
 package mtime
 
 import (
+	"bytes"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -33,6 +36,31 @@ func TestSetTTMinusUTCProvider(t *testing.T) {
 	SetTTMinusUTCProvider(func(time.Time) float64 { return 70.0 })
 	if got := TTMinusUTC(time.Unix(0, 0).UTC()); got != 70.0 {
 		t.Fatalf("unexpected custom TT-UTC: %v", got)
+	}
+}
+
+func TestSetLeapSecondWarnFunc(t *testing.T) {
+	defer SetLeapSecondWarnFunc(nil)
+
+	called := 0
+	SetLeapSecondWarnFunc(func(msg string) {
+		called++
+		if !strings.Contains(msg, "built-in leap second table") {
+			t.Fatalf("unexpected warning message: %q", msg)
+		}
+	})
+
+	leapWarnOnce = sync.Once{}
+	_ = TTMinusUTC(LastLeapSecondDate)
+	if called != 1 {
+		t.Fatalf("expected warning callback once, got %d", called)
+	}
+
+	SetLeapSecondWarnFunc(nil)
+	leapWarnOnce = sync.Once{}
+	_ = TTMinusUTC(LastLeapSecondDate)
+	if called != 1 {
+		t.Fatalf("nil warning callback should suppress warnings")
 	}
 }
 
@@ -291,6 +319,74 @@ func TestFormatParse(t *testing.T) {
 	}
 }
 
+func TestParseDateOnlyDefaultsClockToZero(t *testing.T) {
+	v := "0042-03-10"
+	parsed, err := Parse("MY-MM-DD", v)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	c := parsed.MTC()
+	if c.Hour != 0 || c.Minute != 0 || c.Second != 0 || c.Millisecond != 0 {
+		t.Fatalf("expected zero clock defaults, got %+v", c)
+	}
+	if got := parsed.Format("MY-MM-DD"); got != v {
+		t.Fatalf("unexpected formatted date: got=%q want=%q", got, v)
+	}
+}
+
+func TestParseTimeOnlyDefaultsDateToStart(t *testing.T) {
+	v := "12:34:56.789"
+	parsed, err := Parse("hh:mm:ss.fff", v)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	d := parsed.Date()
+	if d.Year != 1 || d.Month != 1 || d.Day != 1 || d.SolOfYear != 1 {
+		t.Fatalf("expected date defaults to MY0001-01-01, got %+v", d)
+	}
+	if got := parsed.Format("hh:mm:ss.fff"); got != v {
+		t.Fatalf("unexpected formatted time: got=%q want=%q", got, v)
+	}
+}
+
+func TestFormatParseDarianMonthNames(t *testing.T) {
+	base := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789000000, time.UTC))
+
+	fullLayout := "MY MMMM DD hh:mm:ss.fff"
+	fullValue := base.Format(fullLayout)
+	if !strings.Contains(fullValue, DarianMonthName(base.Date().Month)) {
+		t.Fatalf("expected full Darian month in %q", fullValue)
+	}
+	fullParsed, err := Parse(fullLayout, fullValue)
+	if err != nil {
+		t.Fatalf("unexpected full-month parse error: %v", err)
+	}
+	fullDelta := fullParsed.Earth().Sub(base.Earth())
+	if fullDelta < 0 {
+		fullDelta = -fullDelta
+	}
+	if fullDelta > 2*time.Millisecond {
+		t.Fatalf("full-month parse mismatch: got=%v want=%v delta=%v", fullParsed.Earth(), base.Earth(), fullDelta)
+	}
+
+	abbrLayout := "MY MMM DD hh:mm:ss.fff"
+	abbrValue := base.Format(abbrLayout)
+	if !strings.Contains(abbrValue, DarianMonthAbbrev(base.Date().Month)) {
+		t.Fatalf("expected abbreviated Darian month in %q", abbrValue)
+	}
+	abbrParsed, err := Parse(abbrLayout, abbrValue)
+	if err != nil {
+		t.Fatalf("unexpected abbreviated-month parse error: %v", err)
+	}
+	abbrDelta := abbrParsed.Earth().Sub(base.Earth())
+	if abbrDelta < 0 {
+		abbrDelta = -abbrDelta
+	}
+	if abbrDelta > 2*time.Millisecond {
+		t.Fatalf("abbreviated-month parse mismatch: got=%v want=%v delta=%v", abbrParsed.Earth(), base.Earth(), abbrDelta)
+	}
+}
+
 func TestFormatTokenMillisecondPrecision(t *testing.T) {
 	base := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789123000, time.UTC))
 	v := base.Format("fff")
@@ -354,6 +450,26 @@ func TestUnmarshalJSONLegacyUTCNSOnly(t *testing.T) {
 	}
 	if !parsed.Earth().Equal(base.Earth()) {
 		t.Fatalf("legacy json round-trip mismatch: got=%v want=%v", parsed.Earth(), base.Earth())
+	}
+}
+
+func TestGobEncodeDecode(t *testing.T) {
+	base := FromEarth(time.Date(2026, 4, 18, 12, 34, 56, 789123000, time.UTC))
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(base); err != nil {
+		t.Fatalf("gob encode failed: %v", err)
+	}
+
+	var parsed Time
+	dec := gob.NewDecoder(&buf)
+	if err := dec.Decode(&parsed); err != nil {
+		t.Fatalf("gob decode failed: %v", err)
+	}
+
+	if !parsed.Earth().Equal(base.Earth()) {
+		t.Fatalf("gob round-trip mismatch: got=%v want=%v", parsed.Earth(), base.Earth())
 	}
 }
 

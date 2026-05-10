@@ -1,12 +1,12 @@
 package mtime
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -44,6 +44,31 @@ const (
 )
 
 var monthLengths = [...]int{28, 28, 28, 28, 28, 27, 28, 28, 28, 28, 28, 27, 28, 28, 28, 28, 28, 27, 28, 28, 28, 28, 28, 27}
+
+var darianMonthNames = [...]string{
+	"Sagittarius", "Dhanus", "Capricornus", "Makara", "Aquarius", "Kumbha",
+	"Pisces", "Mina", "Aries", "Mesha", "Taurus", "Rishabha",
+	"Gemini", "Mithuna", "Cancer", "Karka", "Leo", "Simha",
+	"Virgo", "Kanya", "Libra", "Tula", "Scorpius", "Vrishika",
+}
+
+var darianMonthAbbrevs = [...]string{
+	"Sag", "Dha", "Cap", "Mak", "Aqu", "Kum",
+	"Pis", "Min", "Ari", "Mes", "Tau", "Ris",
+	"Gem", "Mit", "Can", "Kar", "Leo", "Sim",
+	"Vir", "Kan", "Lib", "Tul", "Sco", "Vri",
+}
+
+var darianMonthNameLookup = func() map[string]int {
+	lookup := make(map[string]int, len(darianMonthNames)+len(darianMonthAbbrevs))
+	for i, name := range darianMonthNames {
+		lookup[strings.ToLower(name)] = i + 1
+	}
+	for i, name := range darianMonthAbbrevs {
+		lookup[strings.ToLower(name)] = i + 1
+	}
+	return lookup
+}()
 
 const secondsPerSolNanos int64 = 88775244147000
 
@@ -122,6 +147,8 @@ var preLeapDrift = [...]preLeapDriftEntry{
 var (
 	ttOffsetMu       sync.RWMutex
 	ttOffsetProvider TTMinusUTCProvider = defaultTTMinusUTC
+	leapWarnMu       sync.RWMutex
+	leapWarnFunc     func(string)
 	leapWarnOnce     sync.Once
 	parseLayoutCache sync.Map
 )
@@ -174,6 +201,30 @@ func SetTTMinusUTCProvider(provider TTMinusUTCProvider) {
 	ttOffsetMu.Unlock()
 }
 
+// SetLeapSecondWarnFunc configures the warning callback used when conversion
+// runs beyond the built-in leap-second table. Set nil to suppress warnings.
+func SetLeapSecondWarnFunc(fn func(string)) {
+	leapWarnMu.Lock()
+	leapWarnFunc = fn
+	leapWarnMu.Unlock()
+}
+
+// DarianMonthName returns the full Darian month name for a 1-based month.
+func DarianMonthName(month int) string {
+	if month < 1 || month > len(darianMonthNames) {
+		return ""
+	}
+	return darianMonthNames[month-1]
+}
+
+// DarianMonthAbbrev returns the 3-letter Darian month abbreviation.
+func DarianMonthAbbrev(month int) string {
+	if month < 1 || month > len(darianMonthAbbrevs) {
+		return ""
+	}
+	return darianMonthAbbrevs[month-1]
+}
+
 // SolsInYear reports how many sols exist in a given Martian year.
 func SolsInYear(year int) int {
 	if isLeapYear(year) {
@@ -219,7 +270,6 @@ func FromMSDSafe(msd float64) (Time, error) {
 	adjustedNanos := roundFloatProductToInt(msd, bigSecondsPerSolNano)
 	return fromAdjustedMSDNanos(adjustedNanos)
 }
-
 
 func fromAdjustedMSDNanos(adjustedNanos *big.Int) (Time, error) {
 	// Seed from the target MSD itself and iteratively account for TT-UTC.
@@ -394,7 +444,7 @@ func (t Time) String() string {
 }
 
 // AppendFormat appends the formatted representation of t to b.
-// Tokens: MY MM DD SSS hh mm ss fff.
+// Tokens: MY MM MMM MMMM DD SSS hh mm ss fff.
 func (t Time) AppendFormat(b []byte, layout string) []byte {
 	d := t.Date()
 	c := t.MTC()
@@ -402,7 +452,7 @@ func (t Time) AppendFormat(b []byte, layout string) []byte {
 }
 
 // Format returns a string formatted with custom tokens.
-// Tokens: MY MM DD SSS hh mm ss fff.
+// Tokens: MY MM MMM MMMM DD SSS hh mm ss fff.
 func (t Time) Format(layout string) string {
 	d := t.Date()
 	c := t.MTC()
@@ -412,7 +462,7 @@ func (t Time) Format(layout string) string {
 }
 
 // Parse parses a Martian time from layout and value.
-// Tokens: MY MM DD SSS hh mm ss fff.
+// Tokens: MY MM MMM MMMM DD SSS hh mm ss fff.
 func Parse(layout, value string) (Time, error) {
 	compiled, err := getCompiledParseLayout(layout)
 	if err != nil {
@@ -428,63 +478,105 @@ func Parse(layout, value string) (Time, error) {
 	hasYear := false
 	hasMonth := false
 	hasDay := false
+	hasSolOfYear := false
 	hasHour := false
 	hasMinute := false
 	hasSecond := false
 	hasMillisecond := false
 	for i, token := range compiled.order {
-		n, convErr := strconv.Atoi(matches[i+1])
-		if convErr != nil {
-			return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
-		}
-
 		switch token {
 		case "MY":
+			n, convErr := strconv.Atoi(matches[i+1])
+			if convErr != nil {
+				return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+			}
 			year = n
 			hasYear = true
 		case "MM":
+			n, convErr := strconv.Atoi(matches[i+1])
+			if convErr != nil {
+				return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+			}
+			month = n
+			hasMonth = true
+		case "MMM", "MMMM":
+			n, ok := parseDarianMonth(matches[i+1])
+			if !ok {
+				return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+			}
 			month = n
 			hasMonth = true
 		case "DD":
+			n, convErr := strconv.Atoi(matches[i+1])
+			if convErr != nil {
+				return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+			}
 			day = n
 			hasDay = true
 		case "SSS":
+			n, convErr := strconv.Atoi(matches[i+1])
+			if convErr != nil {
+				return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+			}
 			solOfYear = n
+			hasSolOfYear = true
 		case "hh":
+			n, convErr := strconv.Atoi(matches[i+1])
+			if convErr != nil {
+				return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+			}
 			hour = n
 			hasHour = true
 		case "mm":
+			n, convErr := strconv.Atoi(matches[i+1])
+			if convErr != nil {
+				return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+			}
 			minute = n
 			hasMinute = true
 		case "ss":
+			n, convErr := strconv.Atoi(matches[i+1])
+			if convErr != nil {
+				return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+			}
 			second = n
 			hasSecond = true
 		case "fff":
+			n, convErr := strconv.Atoi(matches[i+1])
+			if convErr != nil {
+				return Time{}, fmt.Errorf("%w: invalid %s", ErrInvalidFormat, token)
+			}
 			millisecond = n
 			hasMillisecond = true
 		}
 	}
 
 	if !hasYear {
-		return Time{}, fmt.Errorf("%w: missing token MY", ErrInvalidFormat)
+		year = 1
 	}
 	if !hasMonth {
-		return Time{}, fmt.Errorf("%w: missing token MM", ErrInvalidFormat)
+		month = 1
 	}
 	if !hasDay {
-		return Time{}, fmt.Errorf("%w: missing token DD", ErrInvalidFormat)
+		day = 1
+	}
+	if hasSolOfYear && (!hasMonth || !hasDay) {
+		if solOfYear < 1 || solOfYear > SolsInYear(year) {
+			return Time{}, fmt.Errorf("%w: sol-of-year out of range", ErrInvalidFormat)
+		}
+		month, day = splitMonthAndDay(solOfYear-1, isLeapYear(year))
 	}
 	if !hasHour {
-		return Time{}, fmt.Errorf("%w: missing token hh", ErrInvalidFormat)
+		hour = 0
 	}
 	if !hasMinute {
-		return Time{}, fmt.Errorf("%w: missing token mm", ErrInvalidFormat)
+		minute = 0
 	}
 	if !hasSecond {
-		return Time{}, fmt.Errorf("%w: missing token ss", ErrInvalidFormat)
+		second = 0
 	}
 	if !hasMillisecond {
-		return Time{}, fmt.Errorf("%w: missing token fff", ErrInvalidFormat)
+		millisecond = 0
 	}
 
 	return timeFromCalendar(year, month, day, hour, minute, second, millisecond, solOfYear)
@@ -578,6 +670,28 @@ func (t *Time) UnmarshalText(data []byte) error {
 		return err
 	}
 	*t = parsed
+	return nil
+}
+
+// GobEncode implements gob.GobEncoder.
+func (t Time) GobEncode() ([]byte, error) {
+	b := make([]byte, 12)
+	binary.BigEndian.PutUint64(b[:8], uint64(t.earth.Unix()))
+	binary.BigEndian.PutUint32(b[8:], uint32(t.earth.Nanosecond()))
+	return b, nil
+}
+
+// GobDecode implements gob.GobDecoder.
+func (t *Time) GobDecode(data []byte) error {
+	if len(data) != 12 {
+		return fmt.Errorf("%w: invalid gob payload length", ErrInvalidFormat)
+	}
+	sec := int64(binary.BigEndian.Uint64(data[:8]))
+	nsec := int64(binary.BigEndian.Uint32(data[8:]))
+	if nsec < 0 || nsec >= int64(time.Second) {
+		return fmt.Errorf("%w: nano out of range", ErrInvalidFormat)
+	}
+	*t = FromEarth(time.Unix(sec, nsec).UTC())
 	return nil
 }
 
@@ -802,10 +916,20 @@ func defaultTTMinusUTC(at time.Time) float64 {
 	deltaAT := leapSeconds[idx-1].deltaAT
 	if !at.Before(LastLeapSecondDate) {
 		leapWarnOnce.Do(func() {
-			fmt.Fprintf(os.Stderr, "mtime: time %s is past the built-in leap second table (%s); consider SetTTMinusUTCProvider\n", at.Format(time.RFC3339), LastLeapSecondDate.Format(time.RFC3339))
+			warnLeapSecond(fmt.Sprintf("mtime: time %s is past the built-in leap second table (%s); consider SetTTMinusUTCProvider", at.Format(time.RFC3339), LastLeapSecondDate.Format(time.RFC3339)))
 		})
 	}
 	return deltaAT + 32.184
+}
+
+func warnLeapSecond(msg string) {
+	leapWarnMu.RLock()
+	fn := leapWarnFunc
+	leapWarnMu.RUnlock()
+	if fn == nil {
+		return
+	}
+	fn(msg)
 }
 
 func roundFloatProductToInt(v float64, factor *big.Int) *big.Int {
@@ -898,16 +1022,18 @@ func getCompiledParseLayout(layout string) (compiledParseLayout, error) {
 		return cached.(compiledParseLayout), nil
 	}
 
-	tokens := []string{"SSS", "fff", "MY", "MM", "DD", "hh", "mm", "ss"}
+	tokens := []string{"MMMM", "MMM", "SSS", "fff", "MY", "MM", "DD", "hh", "mm", "ss"}
 	patterns := map[string]string{
-		"MY":  `(-?[0-9]+)`,
-		"MM":  `([0-9]{2})`,
-		"DD":  `([0-9]{2})`,
-		"SSS": `([0-9]{3})`,
-		"hh":  `([0-9]{2})`,
-		"mm":  `([0-9]{2})`,
-		"ss":  `([0-9]{2})`,
-		"fff": `([0-9]{3})`,
+		"MMMM": `([A-Za-z]+)`,
+		"MMM":  `([A-Za-z]{3})`,
+		"MY":   `(-?[0-9]+)`,
+		"MM":   `([0-9]{2})`,
+		"DD":   `([0-9]{2})`,
+		"SSS":  `([0-9]{3})`,
+		"hh":   `([0-9]{2})`,
+		"mm":   `([0-9]{2})`,
+		"ss":   `([0-9]{2})`,
+		"fff":  `([0-9]{3})`,
 	}
 
 	order := make([]string, 0, 8)
@@ -941,9 +1067,20 @@ func getCompiledParseLayout(layout string) (compiledParseLayout, error) {
 	return actual.(compiledParseLayout), nil
 }
 
+func parseDarianMonth(token string) (int, bool) {
+	month, ok := darianMonthNameLookup[strings.ToLower(token)]
+	return month, ok
+}
+
 func appendTokenLayout(dst []byte, layout string, d Date, c Clock) []byte {
 	for i := 0; i < len(layout); {
 		switch {
+		case strings.HasPrefix(layout[i:], "MMMM"):
+			dst = append(dst, DarianMonthName(d.Month)...)
+			i += 4
+		case strings.HasPrefix(layout[i:], "MMM"):
+			dst = append(dst, DarianMonthAbbrev(d.Month)...)
+			i += 3
 		case strings.HasPrefix(layout[i:], "SSS"):
 			dst = appendPaddedInt(dst, d.SolOfYear, 3)
 			i += 3
